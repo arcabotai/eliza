@@ -27,6 +27,7 @@ import {
   executePlannedToolCall,
   getInferenceTimer,
   getSwarmCoordinatorService,
+  hasAppliedUserFacingEffectProof,
   INFERENCE_MARKS,
   INSUFFICIENT_CREDITS_REPLY,
   InferenceTurnTimer,
@@ -40,10 +41,12 @@ import {
   type RolesWorldMetadata,
   type RouteRequestContext,
   recordOwnerGrant,
+  revertedEffectReceiptIds,
   runWithInferenceTiming,
   runWithTrajectoryContext,
   stringToUuid,
   type TrustedApiPrincipal,
+  tagsMayProduceEffects,
   timeInferenceSpan,
   trackPostDeliveryTask,
   type UUID,
@@ -74,6 +77,7 @@ import {
 import { resolveTrajectoryGrouping } from "../runtime/trajectory-internals.ts";
 import { startTrajectoryStepInDatabase } from "../runtime/trajectory-storage.ts";
 import { syncCharacterIntoConfig } from "../services/character-persistence.ts";
+import { createChatIdempotencyStore } from "../services/chat-idempotency-service.ts";
 import { detectRuntimeModel } from "./agent-model.ts";
 import {
   maybeAugmentChatMessageWithDocuments,
@@ -256,10 +260,6 @@ function getLocalInferenceChatApi(): Promise<LocalInferenceChatApi> {
 
 const CHAT_MAX_BODY_BYTES = 20 * 1024 * 1024; // 20 MB (image-capable)
 
-/** Max accepted client-supplied idempotency key length. Anything longer is a
- *  malformed/abusive client and is treated as absent (no dedupe). */
-const CLIENT_MESSAGE_ID_MAX_LENGTH = 128;
-
 /**
  * Short-window idempotency cache for the HTTP chat path, the analogue of the
  * WebSocket `isDuplicateWsMessage` cache in server.ts. Chat sends go over HTTP
@@ -293,25 +293,12 @@ export interface ChatMessageIdOutcome {
   noResponseReason?: "ignored";
 }
 
-interface ChatMessageIdEntry {
-  firstSeenAt: number;
-  settledAt?: number;
-  outcome?: ChatMessageIdOutcome;
-}
-
-const chatSeenMessageIds = new Map<string, ChatMessageIdEntry>();
-const CHAT_SETTLED_OUTCOME_RETENTION_MS = 5 * 60_000;
-let chatSeenLastSweepAt = 0;
+const chatIdempotency = createChatIdempotencyStore<ChatMessageIdOutcome>();
 
 /** Normalize a raw body value into a usable idempotency key, or `null` when
  *  absent/invalid. Exported for unit testing the dedupe decision in isolation. */
 export function normalizeClientMessageId(value: unknown): string | null {
-  if (typeof value !== "string") return null;
-  const trimmed = value.trim();
-  if (trimmed.length === 0 || trimmed.length > CLIENT_MESSAGE_ID_MAX_LENGTH) {
-    return null;
-  }
-  return trimmed;
+  return chatIdempotency.normalize(value);
 }
 
 /**
@@ -328,33 +315,7 @@ export function isDuplicateChatMessage(
   clientMessageId: string | null,
   now: number = Date.now(),
 ): boolean {
-  if (!clientMessageId) return false;
-  const key = `${scope}:${clientMessageId}`;
-  const entry = chatSeenMessageIds.get(key);
-  if (entry !== undefined) {
-    if (
-      entry.settledAt === undefined ||
-      now - entry.settledAt <= CHAT_SETTLED_OUTCOME_RETENTION_MS
-    ) {
-      return true;
-    }
-    chatSeenMessageIds.delete(key);
-  }
-  chatSeenMessageIds.set(key, { firstSeenAt: now });
-  // Active entries have an explicit owner and may not be evicted. Only settled
-  // outcomes are swept, amortizing the O(n) scan across the retention window.
-  if (now - chatSeenLastSweepAt > CHAT_SETTLED_OUTCOME_RETENTION_MS) {
-    chatSeenLastSweepAt = now;
-    for (const [seenKey, seenEntry] of chatSeenMessageIds) {
-      if (
-        seenEntry.settledAt !== undefined &&
-        now - seenEntry.settledAt > CHAT_SETTLED_OUTCOME_RETENTION_MS
-      ) {
-        chatSeenMessageIds.delete(seenKey);
-      }
-    }
-  }
-  return false;
+  return chatIdempotency.reserve(scope, clientMessageId, now);
 }
 
 /**
@@ -375,8 +336,7 @@ export function releaseChatMessageId(
   scope: string,
   clientMessageId: string | null,
 ): void {
-  if (!clientMessageId) return;
-  chatSeenMessageIds.delete(`${scope}:${clientMessageId}`);
+  chatIdempotency.release(scope, clientMessageId);
 }
 
 /**
@@ -389,10 +349,7 @@ export function getChatMessageIdFirstSeenAt(
   scope: string,
   clientMessageId: string | null,
 ): number | null {
-  if (!clientMessageId) return null;
-  return (
-    chatSeenMessageIds.get(`${scope}:${clientMessageId}`)?.firstSeenAt ?? null
-  );
+  return chatIdempotency.firstSeenAt(scope, clientMessageId);
 }
 
 /**
@@ -408,12 +365,7 @@ export function setChatMessageIdOutcome(
   clientMessageId: string | null,
   outcome: ChatMessageIdOutcome,
 ): void {
-  if (!clientMessageId) return;
-  const key = `${scope}:${clientMessageId}`;
-  const entry = chatSeenMessageIds.get(key);
-  if (!entry) return;
-  entry.outcome = structuredClone(outcome);
-  entry.settledAt = Date.now();
+  chatIdempotency.settle(scope, clientMessageId, outcome);
 }
 
 /** Return the durable outcome bound to an exact idempotency key, if settled. */
@@ -421,22 +373,18 @@ export function getChatMessageIdOutcome(
   scope: string,
   clientMessageId: string | null,
 ): ChatMessageIdOutcome | null {
-  if (!clientMessageId) return null;
-  const outcome =
-    chatSeenMessageIds.get(`${scope}:${clientMessageId}`)?.outcome ?? null;
-  return outcome ? structuredClone(outcome) : null;
+  return chatIdempotency.outcome(scope, clientMessageId);
 }
 
 /** Test-only: clear the HTTP chat idempotency cache between cases. */
 export function __resetChatDedupeForTests(): void {
-  chatSeenMessageIds.clear();
-  chatSeenLastSweepAt = 0;
+  chatIdempotency.reset();
 }
 
 /** Test-only: expose the configured dedupe window without freezing env policy
  *  into the unit fixtures. */
 export function __getChatDedupeTtlMsForTests(): number {
-  return CHAT_SETTLED_OUTCOME_RETENTION_MS;
+  return chatIdempotency.retentionMs;
 }
 
 const ANDROID_LOCAL_DIRECT_CHAT_DENY_PATTERN =
@@ -475,11 +423,15 @@ function readPositiveIntegerSetting(
 }
 
 function isAndroidLocalDirectChatRuntime(runtime: AgentRuntime): boolean {
-  const optOut = readRuntimeStringSetting(
+  const optIn = readRuntimeStringSetting(
     runtime,
     "ELIZA_MOBILE_LOCAL_DIRECT_REPLY",
   );
-  if (/^(0|false|no|off)$/i.test(optOut ?? "")) {
+  // A native device bridge says where capabilities execute, not which model
+  // owns conversation. Bypassing the full Eliza planner is therefore explicit
+  // opt-in; merely connecting an Android/iOS bridge must keep chat on the host
+  // runtime and its configured model providers.
+  if (!/^(1|true|yes|on)$/i.test(optIn ?? "")) {
     return false;
   }
   const platform =
@@ -739,6 +691,7 @@ async function rewriteDirectActionCallbackText(args: {
   actionName: string;
   text: string;
   content?: Content;
+  abortSignal?: AbortSignal;
 }): Promise<string> {
   const text = args.text.trim();
   if (!text) return args.text;
@@ -749,6 +702,7 @@ async function rewriteDirectActionCallbackText(args: {
         : "";
     return `I ran ${args.actionName} and got a result, but I couldn't format the details cleanly here.${error}`;
   };
+  if (args.abortSignal?.aborted) return fallback();
   try {
     const raw = await args.runtime.useModel(ModelType.TEXT_SMALL, {
       prompt: [
@@ -777,6 +731,7 @@ async function rewriteDirectActionCallbackText(args: {
         })}`,
       ].join("\n"),
       maxTokens: 260,
+      signal: args.abortSignal,
       providerOptions: { eliza: { thinking: "off" } },
     });
     const parsed = JSON.parse(String(raw).trim()) as { response?: unknown };
@@ -1008,6 +963,82 @@ export interface ChatGenerateOptions {
   abortSignal?: AbortSignal;
   resolveNoResponseText?: () => string;
   preferredLanguage?: string;
+}
+
+const POST_COMMIT_INTERRUPTED_REPLY =
+  "The action finished before the response was interrupted. It was not run again.";
+
+function recoverSettledMutatingActionTurn(
+  runtime: AgentRuntime,
+  settledResults: readonly ActionResult[],
+): {
+  text: string;
+  actionResults: ActionResult[];
+  actionNames: string[];
+} | null {
+  const allReceipts = settledResults.flatMap(
+    (result) => result.effectReceipts ?? [],
+  );
+  const revertedReceiptIds = revertedEffectReceiptIds(allReceipts);
+  const actionByName = new Map(
+    runtime.actions.map((action) => [action.name, action]),
+  );
+  const committedResults = settledResults.filter((result) => {
+    const receipts = result.effectReceipts ?? [];
+    const hasActiveAppliedReceipt = receipts.some(
+      (receipt) =>
+        receipt.outcome === "applied" &&
+        !revertedReceiptIds.has(receipt.receiptId),
+    );
+    if (receipts.length > 0) return hasActiveAppliedReceipt;
+    if (
+      result.data?.reconciliationRequired === true &&
+      result.data?.retryable === false
+    ) {
+      return true;
+    }
+    const actionName =
+      typeof result.data?.actionName === "string" ? result.data.actionName : "";
+    return (
+      result.success !== false &&
+      tagsMayProduceEffects(actionByName.get(actionName)?.tags)
+    );
+  });
+  if (committedResults.length === 0) return null;
+
+  let verifiedResult: ActionResult | undefined;
+  try {
+    verifiedResult = [...committedResults]
+      .reverse()
+      .find((result) => hasAppliedUserFacingEffectProof(result, allReceipts));
+  } catch (error) {
+    // error-policy:J4 conflicting receipt evidence degrades to the explicit
+    // post-commit interruption reply rather than inventing action-specific text.
+    runtime.logger.warn(
+      {
+        src: "eliza-api",
+        error: getErrorMessage(error),
+      },
+      "Conflicting action receipts prevented exact post-commit reply recovery",
+    );
+  }
+  const verifiedText = verifiedResult?.userFacingText?.trim();
+  const actionNames = Array.from(
+    new Set(
+      committedResults
+        .map((result) =>
+          typeof result.data?.actionName === "string"
+            ? result.data.actionName
+            : "",
+        )
+        .filter((name) => name.length > 0),
+    ),
+  );
+  return {
+    text: verifiedText || POST_COMMIT_INTERRUPTED_REPLY,
+    actionResults: [...settledResults],
+    actionNames,
+  };
 }
 
 function isAppendOnlyStreamDivergenceError(
@@ -2385,6 +2416,16 @@ export async function persistExactConversationMemory(
   runtime: AgentRuntime,
   memory: ReturnType<typeof createMessageMemory>,
 ): Promise<ReturnType<typeof createMessageMemory>> {
+  return (await persistExactConversationMemoryResult(runtime, memory)).memory;
+}
+
+export async function persistExactConversationMemoryResult(
+  runtime: AgentRuntime,
+  memory: ReturnType<typeof createMessageMemory>,
+): Promise<{
+  created: boolean;
+  memory: ReturnType<typeof createMessageMemory>;
+}> {
   if (!memory.id) {
     throw new ElizaError(
       "Exact conversation memory is missing its durable id",
@@ -2429,14 +2470,14 @@ export async function persistExactConversationMemory(
   };
 
   const existing = await loadExisting();
-  if (existing) return assertExact(existing);
+  if (existing) return { created: false, memory: assertExact(existing) };
 
   try {
     await runtime.createMemory(memory, "messages");
-    return memory;
+    return { created: true, memory };
   } catch (cause) {
     const raced = await loadExisting();
-    if (raced) return assertExact(raced);
+    if (raced) return { created: false, memory: assertExact(raced) };
     throw new ElizaError("Failed to store exact conversation memory", {
       code: "CONVERSATION_MEMORY_WRITE_FAILED",
       cause,
@@ -3037,11 +3078,14 @@ async function generateChatResponseWithTiming(
           opts,
         }),
     );
-    generationAbortController.signal.throwIfAborted();
     if (androidDirectResult) {
+      // A successful model return commits the turn even when transport
+      // cancellation races with that return. Discarding it here would release
+      // the retry key and bill the same completed work a second time.
       try {
         if (
           androidDirectResult.responseContent &&
+          !generationAbortController.signal.aborted &&
           typeof runtime.emitEvent === "function"
         ) {
           const memoryLike = createMessageMemory({
@@ -3071,6 +3115,7 @@ async function generateChatResponseWithTiming(
       }
       return androidDirectResult;
     }
+    generationAbortController.signal.throwIfAborted();
 
     let result:
       | Awaited<
@@ -3079,6 +3124,7 @@ async function generateChatResponseWithTiming(
           >
         >
       | undefined;
+    const settledActionResults: ActionResult[] = [];
     let capturedUsage: CapturedModelUsage | null = null;
     const recordActionCallback = (
       actionTag: string,
@@ -3133,8 +3179,10 @@ async function generateChatResponseWithTiming(
             appendText: replaceCallbackText,
             replaceText: emitSnapshot,
           });
-          generationAbortController.signal.throwIfAborted();
           if (preHandlerResult) {
+            // A handler that returns a terminal reply owns completion. A late
+            // disconnect must not erase a completed direct dispatch and cause
+            // the client retry to execute it again.
             const directText = preHandlerResult.responseText;
             const finalText = isClientVisibleNoResponse(directText)
               ? directText || "(no response)"
@@ -3148,6 +3196,7 @@ async function generateChatResponseWithTiming(
             forcedWalletExecutionText = isClientVisibleNoResponse(directText);
             return;
           }
+          generationAbortController.signal.throwIfAborted();
 
           // Direct dispatch for explicit task creation intent from UI
           const contentMetadata = message.content.metadata as
@@ -3213,6 +3262,7 @@ async function generateChatResponseWithTiming(
                             actionName: createTaskAction.name,
                             text: chunk,
                             content,
+                            abortSignal: generationAbortController.signal,
                           });
                         applyCallbackTextUpdate(content, voicedChunk);
                         actionResponseText = responseText;
@@ -3229,7 +3279,9 @@ async function generateChatResponseWithTiming(
                     abortSignal: generationAbortController.signal,
                   },
                 );
-                generationAbortController.signal.throwIfAborted();
+                // The action has already returned a committed result. Keep
+                // finalizing it if the transport disappears at this boundary
+                // so reconnect cannot repeat an external side effect.
                 const finalText =
                   actionResponseText ||
                   directActionResult.text ||
@@ -3247,6 +3299,7 @@ async function generateChatResponseWithTiming(
             // Fall through to normal LLM-based routing if coordinator not available
           }
 
+          generationAbortController.signal.throwIfAborted();
           const localInferenceIntent = detectLocalInferenceCommandIntent(
             originalUserText,
             {
@@ -3256,6 +3309,7 @@ async function generateChatResponseWithTiming(
           if (localInferenceIntent) {
             const { handleLocalInferenceChatCommand } =
               await getLocalInferenceChatApi();
+            generationAbortController.signal.throwIfAborted();
             const localResult = await handleLocalInferenceChatCommand(
               localInferenceIntent,
               originalUserText,
@@ -3302,79 +3356,119 @@ async function generateChatResponseWithTiming(
             { phase: "pre-model" },
           );
           generationAbortController.signal.throwIfAborted();
-          result = await timeInferenceSpan(
-            "chat:message-service",
-            async () =>
-              runtime.messageService?.handleMessage(
-                runtime,
-                generationMessage,
-                async (content: Content, actionName?: string) => {
-                  if (content.transcriptVisibility === "internal") {
-                    return [];
-                  }
+          try {
+            result = await timeInferenceSpan(
+              "chat:message-service",
+              async () =>
+                runtime.messageService?.handleMessage(
+                  runtime,
+                  generationMessage,
+                  async (content: Content, actionName?: string) => {
+                    if (content.transcriptVisibility === "internal") {
+                      return [];
+                    }
 
-                  const chunk = extractCompatTextContent(content);
-                  const visibleChunk = isInternalStructuredStreamText(chunk)
-                    ? ""
-                    : chunk;
-                  const attributedActionName = normalizeActionName(actionName);
-                  const progressCallback = isProgressActionCallback(content);
-                  if (!visibleChunk) {
-                    if (attributedActionName) {
-                      recordActionCallback(attributedActionName, false);
-                    }
-                    return [];
-                  }
-                  if (!claimStreamSource("callback")) {
-                    if (attributedActionName) {
-                      recordActionCallback(attributedActionName, false);
-                    }
-                    return [];
-                  }
-                  if (!progressCallback) {
-                    visibleCallbackDeliveries += 1;
-                  }
-                  applyCallbackTextUpdate(content, visibleChunk);
-                  if (attributedActionName) {
-                    recordActionCallback(
-                      attributedActionName,
-                      !progressCallback,
-                      progressCallback ? undefined : visibleChunk,
-                    );
-                  }
-                  return [];
-                },
-                {
-                  abortSignal: generationAbortController.signal,
-                  keepExistingResponses: true,
-                  onStreamChunk: opts?.onChunk
-                    ? async (
-                        chunk: string,
-                        _messageId?: string,
-                        accumulated?: string,
-                      ) => {
-                        if (!chunk) return;
-                        if (isInternalStructuredStreamText(chunk)) {
-                          // A native planner/tool step, not visible reply text:
-                          // fork it onto the working indicator + inline tool row
-                          // instead of leaking JSON into the bubble.
-                          const events =
-                            chatEventsFromStructuredStreamText(chunk);
-                          if (events?.status) emitStatus(events.status);
-                          if (events?.toolEvent) {
-                            opts?.onToolEvent?.(events.toolEvent);
-                          }
-                          return;
-                        }
-                        if (!claimStreamSource("onStreamChunk")) return;
-                        appendIncomingText(chunk, accumulated);
+                    const chunk = extractCompatTextContent(content);
+                    const visibleChunk = isInternalStructuredStreamText(chunk)
+                      ? ""
+                      : chunk;
+                    const attributedActionName =
+                      normalizeActionName(actionName);
+                    const progressCallback = isProgressActionCallback(content);
+                    if (!visibleChunk) {
+                      if (attributedActionName) {
+                        recordActionCallback(attributedActionName, false);
                       }
-                    : undefined,
-                },
-              ),
-            { phase: "message" },
-          );
-          generationAbortController.signal.throwIfAborted();
+                      return [];
+                    }
+                    if (!claimStreamSource("callback")) {
+                      if (attributedActionName) {
+                        recordActionCallback(attributedActionName, false);
+                      }
+                      return [];
+                    }
+                    if (!progressCallback) {
+                      visibleCallbackDeliveries += 1;
+                    }
+                    applyCallbackTextUpdate(content, visibleChunk);
+                    if (attributedActionName) {
+                      recordActionCallback(
+                        attributedActionName,
+                        !progressCallback,
+                        progressCallback ? undefined : visibleChunk,
+                      );
+                    }
+                    return [];
+                  },
+                  {
+                    abortSignal: generationAbortController.signal,
+                    keepExistingResponses: true,
+                    onSettledActionResult: (actionResult) => {
+                      settledActionResults.push(actionResult);
+                    },
+                    onStreamChunk: opts?.onChunk
+                      ? async (
+                          chunk: string,
+                          _messageId?: string,
+                          accumulated?: string,
+                        ) => {
+                          if (!chunk) return;
+                          if (isInternalStructuredStreamText(chunk)) {
+                            // A native planner/tool step, not visible reply text:
+                            // fork it onto the working indicator + inline tool row
+                            // instead of leaking JSON into the bubble.
+                            const events =
+                              chatEventsFromStructuredStreamText(chunk);
+                            if (events?.status) emitStatus(events.status);
+                            if (events?.toolEvent) {
+                              opts?.onToolEvent?.(events.toolEvent);
+                            }
+                            return;
+                          }
+                          if (!claimStreamSource("onStreamChunk")) return;
+                          appendIncomingText(chunk, accumulated);
+                        }
+                      : undefined,
+                  },
+                ),
+              { phase: "message" },
+            );
+          } catch (error) {
+            // error-policy:J1 this API boundary preserves a proven committed
+            // effect while translating later turn failure into a durable reply.
+            const recovery = recoverSettledMutatingActionTurn(
+              runtime,
+              settledActionResults,
+            );
+            if (!recovery) throw error;
+            responseText = recovery.text;
+            result = {
+              didRespond: true,
+              responseContent: {
+                text: recovery.text,
+                ...(recovery.actionNames.length > 0
+                  ? { actions: recovery.actionNames }
+                  : {}),
+              },
+              responseMessages: [],
+              actionResults: recovery.actionResults,
+              mode: "actions",
+            } as typeof result;
+            runtime.logger.warn(
+              {
+                src: "eliza-api",
+                messageId: message.id,
+                roomId: message.roomId,
+                actionNames: recovery.actionNames,
+                error: getErrorMessage(error),
+              },
+              "Recovered a settled mutating action after message processing stopped",
+            );
+          }
+          // A successful return preserves the completed model/message result,
+          // but it is not permission to start optional post-processing after a
+          // disconnect. The remaining path finalizes that result and only runs
+          // new work while the owner signal is live.
 
           // Ensure MESSAGE_SENT hooks run for API chat flows.
           try {
@@ -3410,6 +3504,7 @@ async function generateChatResponseWithTiming(
                   : [];
             if (
               messagesToEmit.length > 0 &&
+              !generationAbortController.signal.aborted &&
               typeof runtime.emitEvent === "function"
             ) {
               for (const responseMessage of messagesToEmit) {
@@ -3494,7 +3589,10 @@ async function generateChatResponseWithTiming(
                 });
               let successfulFallbackActions = new Set<string>();
 
-              if (selfControlFallbackActions.length > 0) {
+              if (
+                selfControlFallbackActions.length > 0 &&
+                !generationAbortController.signal.aborted
+              ) {
                 const fallbackExecutions = await executeFallbackParsedActions(
                   runtime,
                   message,
@@ -3502,6 +3600,7 @@ async function generateChatResponseWithTiming(
                   appendIncomingText,
                   recordActionCallback,
                   {
+                    abortSignal: generationAbortController.signal,
                     getCurrentText: () => responseText || modelText,
                   },
                 );
@@ -3664,10 +3763,9 @@ async function generateChatResponseWithTiming(
     }
 
     const noResponseFallback = opts?.resolveNoResponseText?.();
-    const exactDocumentValue = await resolveExactDocumentValueForChat(
-      runtime,
-      message,
-    );
+    const exactDocumentValue = generationAbortController.signal.aborted
+      ? null
+      : await resolveExactDocumentValueForChat(runtime, message);
     const normalizedResponseText = trimWalletProgressPrefix(
       exactDocumentValue || responseText || resultText || "",
     );
@@ -3681,11 +3779,17 @@ async function generateChatResponseWithTiming(
         ? (noResponseFallback ??
           (normalizedResponseText || responseText || "(no response)"))
         : normalizedResponseText;
-    const transcriptVisibility = resolveFinalTranscriptVisibility(
-      finalText,
-      result?.actionResults,
-      resultContentCandidates,
-    );
+    // A visible action callback and its internal terminal receipt can carry the
+    // same canonical text. The receipt stays out of the transcript, but it must
+    // not retroactively hide the callback that already owns the turn's response.
+    const transcriptVisibility =
+      visibleCallbackDeliveries > 0
+        ? undefined
+        : resolveFinalTranscriptVisibility(
+            finalText,
+            result?.actionResults,
+            resultContentCandidates,
+          );
 
     if (opts?.onChunk && !opts.onSnapshot) {
       const authoritativeText =

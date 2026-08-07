@@ -64,11 +64,9 @@ function collectSourceFiles(dir: string, out: string[] = []): string[] {
 const ALLOWED_BLUR = new Set<string>([
   "packages/ui/src/components/shell/liquid-glass.tsx",
   "packages/ui/src/components/shell/liquid-glass.stories.tsx",
-  "packages/ui/src/components/shell/home-glass.ts",
   "packages/ui/src/components/shell/wallpaper-idiom.ts",
   "packages/ui/src/components/shell/ChatOverlay.tsx",
   "packages/ui/src/components/shell/NotificationsHomeCenter.tsx",
-  "packages/ui/src/components/shell/NotificationBanners.tsx",
   "packages/ui/src/components/shell/BuildBadge.tsx",
   "packages/ui/src/components/chat/widgets/home-widget-card.tsx",
   // First-run has no shared chat panel behind assistant turns. Its greeting
